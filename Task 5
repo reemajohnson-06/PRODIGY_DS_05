@@ -1,0 +1,144 @@
+# Task-05: US Traffic Accidents -- Road condition/weather/time-of-day patterns + hotspots
+# Requirements: pandas, numpy, matplotlib, seaborn, folium, sklearn
+import os
+import zipfile
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import folium
+from folium.plugins import HeatMap
+from sklearn.cluster import DBSCAN
+
+plt.style.use("seaborn-v0_8-whitegrid")
+pd.set_option("display.max_columns", 120)
+pd.set_option("display.max_rows", 80)
+
+# 1) unzip if needed
+zip_path = r"c:\Users\Reema Johnson\Desktop\prodigy 5a\US_Accidents_March23.csv.zip"
+csv_path = r"c:\Users\Reema Johnson\Desktop\prodigy 5a\US_Accidents_March23.csv"
+if os.path.exists(zip_path) and not os.path.exists(csv_path):
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(os.path.dirname(csv_path))
+        print("Extracted", csv_path)
+
+# 2) load data (sample if huge)
+print("Loading CSV... (this may take a while)")
+df = pd.read_csv(csv_path, low_memory=False)
+
+# quick check
+print("Rows:", len(df), "columns:", len(df.columns))
+print(df.dtypes)
+
+# 3) choose relevant columns
+cols = [
+    "ID", "Source", "Severity", "Start_Time", "End_Time", "Start_Lat", "Start_Lng",
+    "Street", "City", "State", "Country", "Timezone", "Airport_Code",
+    "Weather_Condition", "Wind_Direction", "Weather_Timestamp",
+    "Temperature(F)", "Humidity(%)", "Pressure(in)", "Visibility(mi)",
+    "Wind_Speed(mph)", "Precipitation(in)", "Amenity", "Bump", "Crossing",
+    "Give_Way", "Junction", "No_Exit", "Railway", "Roundabout", "Station",
+    "Stop", "Traffic_Calming", "Traffic_Signal", "Turning_Loop", "Sunrise_Sunset",
+    "Civil_Twilight", "Nautical_Twilight", "Astronomical_Twilight",
+]
+df = df.loc[:, [c for c in cols if c in df.columns]]
+
+# 4) datetime features
+df["Start_Time"] = pd.to_datetime(df["Start_Time"], errors="coerce")
+df["End_Time"] = pd.to_datetime(df["End_Time"], errors="coerce")
+df["hour"] = df["Start_Time"].dt.hour
+df["weekday"] = df["Start_Time"].dt.day_name()
+df["month"] = df["Start_Time"].dt.month
+df["date"] = df["Start_Time"].dt.date
+
+def time_of_day(h):
+    if pd.isna(h):
+        return np.nan
+    if 5 <= h < 12:
+        return "Morning"
+    if 12 <= h < 17:
+        return "Afternoon"
+    if 17 <= h < 21:
+        return "Evening"
+    return "Night"
+
+df["time_of_day"] = df["hour"].apply(time_of_day)
+
+# 5) target clean road/weather fields
+for c in ["Weather_Condition", "Junction", "Amenity","Bump","Crossing","Give_Way","No_Exit","Railway","Roundabout","Station","Stop","Traffic_Calming","Traffic_Signal","Turning_Loop", "Sunrise_Sunset"]:
+    if c in df.columns:
+        df[c] = df[c].astype(str).fillna("Unknown").replace("nan", "Unknown")
+
+# 6) pattern summaries
+
+print("Accidents by time of day:\n", df["time_of_day"].value_counts(normalize=True) * 100)
+print("Accidents by weather condition (top 15):\n", df["Weather_Condition"].value_counts().head(15))
+
+# Weighted by severity if available
+if "Severity" in df.columns:
+    w = df.groupby("time_of_day")["Severity"].mean().sort_values(ascending=False)
+    print("Avg severity by time-of-day:\n", w)
+
+# weather vs severity
+if "Weather_Condition" in df.columns:
+    wc = df.groupby("Weather_Condition")["Severity"].mean().sort_values(ascending=False).head(20)
+    print("Top 20 weather conditions by avg severity:\n", wc)
+
+# 7) visualize
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+sns.countplot(data=df, x="time_of_day", order=["Morning", "Afternoon", "Evening", "Night"], ax=axes[0,0])
+axes[0,0].set_title("Accident count by Time of Day")
+sns.countplot(data=df, y="Weather_Condition", order=df["Weather_Condition"].value_counts().head(15).index, ax=axes[0,1])
+axes[0,1].set_title("Top 15 Weather Conditions")
+sns.countplot(data=df, y="weekday", order=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], ax=axes[1,0])
+axes[1,0].set_title("Accidents by Weekday")
+if "Severity" in df.columns:
+    sns.boxplot(data=df, x="Severity", y="time_of_day", order=["Morning","Afternoon","Evening","Night"], ax=axes[1,1])
+    axes[1,1].set_title("Severity Distribution by Time of Day")
+plt.tight_layout()
+plt.show()
+
+# 8) heatmap of accident hotspots (lat/lng)
+df_geo = df.dropna(subset=["Start_Lat","Start_Lng"]).copy()
+df_geo = df_geo[(df_geo["Start_Lat"].between(24,50)) & (df_geo["Start_Lng"].between(-125, -66))]
+mean_lat, mean_lng = df_geo["Start_Lat"].mean(), df_geo["Start_Lng"].mean()
+m = folium.Map(location=[mean_lat, mean_lng], zoom_start=5, tiles="Stamen Terrain")
+heat_data = df_geo[["Start_Lat","Start_Lng"]].values.tolist()
+HeatMap(heat_data, radius=8, blur=12, max_zoom=12).add_to(m)
+m.save("us_accident_hotspot_heatmap.html")
+print("Saved us_accident_hotspot_heatmap.html")
+
+# 9) cluster hotspot regions with DBSCAN
+coords = df_geo[["Start_Lat","Start_Lng"]].values
+db = DBSCAN(eps=0.05, min_samples=45, metric="haversine").fit(np.radians(coords))
+df_geo["cluster"] = db.labels_
+top_clusters = (
+    df_geo[df_geo["cluster"] >= 0]
+    .groupby("cluster")
+    .size()
+    .sort_values(ascending=False)
+    .head(10)
+)
+print("Top clusters (accident hotspots by cluster size):\n", top_clusters)
+
+# compute cluster centroids
+centroids = (
+    df_geo[df_geo["cluster"] >= 0]
+    .groupby("cluster")[["Start_Lat","Start_Lng"]]
+    .mean()
+    .loc[top_clusters.index]
+)
+print("Top cluster centers:\n", centroids)
+
+# add cluster markers to map
+for cl, row in centroids.iterrows():
+    folium.CircleMarker(
+        location=[row["Start_Lat"], row["Start_Lng"]],
+        radius=12,
+        color="red",
+        fill=True,
+        fill_opacity=0.7,
+        popup=f"Cluster {cl} count {top_clusters.loc[cl]}"
+    ).add_to(m)
+m.save("us_accident_hotspot_clusters.html")
+print("Saved us_accident_hotspot_clusters.html")
